@@ -62,7 +62,7 @@ noise_model    = "ar1"     # AR(1) temporal autocorrelation correction
 smoothing_FWHM = 6.0       # mm FWHM Gaussian kernel (standard for group comparisons in small FOV)
 
 # Quality control
-max_mean_fd    = 0.5   # mm — exclude subject if mean FD > threshold
+max_mean_fd    = 0.5   # mm, exclude subject if mean FD > threshold
 max_spike_frac = 0.20  # exclude if > 20 % volumes have FD > 0.5 mm
 
 # Statistics
