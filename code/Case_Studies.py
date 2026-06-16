@@ -8,9 +8,6 @@ H03  Higher neuroticism → activity changes (any direction) for POSITIVE expres
 H04  Neuroticism–amygdala/dmPFC association is stronger for negative than positive expressions (negative > positive)
 """
 
-# ──────────────────────────────────────────────────────────────────────────────
-# IMPORTS
-# ──────────────────────────────────────────────────────────────────────────────
 import os
 import glob
 import argparse
@@ -27,6 +24,7 @@ from nilearn.glm.second_level import SecondLevelModel
 from nilearn import plotting
 from nilearn.maskers import NiftiMasker
 from nilearn.datasets import fetch_atlas_harvard_oxford
+from nilearn.image import load_mni152_brain_mask
 from nilearn.glm import threshold_stats_img
 import statsmodels.formula.api as smf
 from statsmodels.stats.multitest import multipletests
@@ -51,7 +49,7 @@ output = os.path.join(root, "derivatives", "neuroticism_analysis")
 # Acquisition parameters
 tr             = 0.75  # seconds, MB3 multiband, face-perception task
 n_volumes      = 330   # volumes per run  (247.5 s / 0.75 s)
-slice_time_ref = 0.5   # reference slice = midpoint of TR
+slice_time_ref = 0.0   # reference slice = midpoint of TR
                          # Note: fMRIPrep PIOP1 did NOT apply slice-timing correction, so this mainly affects the HRF shift.
 
 # GLM parameters
@@ -67,7 +65,6 @@ max_spike_frac = 0.20  # exclude if > 20 % volumes have FD > 0.5 mm
 
 # Statistics
 roi_fdr_alpha = 0.05  # FDR-BH threshold for ROI tests
-wb_z_thresh   = 3.29  # z ≈ p < 0.001 uncorrected for whole-brain
 wb_cluster_k  = 20    # minimum cluster size (voxels)
 
 
@@ -98,8 +95,7 @@ def subject_paths(sub_id: str) -> dict:
                       if os.path.exists(os.path.join(func_deriv,
                           f"{base}_desc-confounds_timeseries.tsv")) # fMRIPrep ≥ 1.4 uses _desc-confounds_timeseries.tsv
                       else os.path.join(func_deriv, f"{base}_desc-confounds_regressors.tsv")), # older fMRIPrep uses _desc-confounds_regressors.tsv
-        "events": os.path.join(func_raw, f"{base}_events.tsv"),
-    }
+        "events": os.path.join(func_raw, f"{base}_events.tsv")}
 
 
 def paths_ok(paths: dict) -> bool:
@@ -121,9 +117,9 @@ def motion_stats(confounds_file: str) -> tuple:
     col = "framewise_displacement"
     if col not in cf.columns:
         return np.nan, np.nan
-    fd = cf[col].fillna(0).values
-    mfd = float(np.mean(fd))
-    spikes = float(np.mean(fd > 0.5))
+    fd = cf[col].values
+    mfd = float(np.nanmean(fd[1:]))
+    spikes = float(np.mean(fd[1:][~np.isnan(fd[1:])] > 0.5))
     return mfd, spikes
 
 
@@ -138,22 +134,43 @@ def motion_stats(confounds_file: str) -> tuple:
    # - quadratic terms (suffix_power2)
    # - derivative quadratic terms (_derivative1_power2) → 24 total motion
    # - top 5 aCompCor components (a_comp_cor_00 … _04)
-   # - global_signal
+    # - if this aCompCor is not available, use global signal instead
 """
 def select_confounds(confounds_file: str) -> pd.DataFrame:
     cf = pd.read_csv(confounds_file, sep="\t")
-    wanted = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z",
-              "trans_x_derivative1", "trans_y_derivative1", "trans_z_derivative1",
-              "rot_x_derivative1", "rot_y_derivative1", "rot_z_derivative1",
-              "trans_x_power2", "trans_y_power2", "trans_z_power2",
-              "rot_x_power2", "rot_y_power2",  "rot_z_power2",
-              "trans_x_derivative1_power2", "trans_y_derivative1_power2", "trans_z_derivative1_power2",
-              "rot_x_derivative1_power2",   "rot_y_derivative1_power2", "rot_z_derivative1_power2",
-              "a_comp_cor_00", "a_comp_cor_01", "a_comp_cor_02", "a_comp_cor_03", "a_comp_cor_04",
-              "global_signal"]
-    cols   = [c for c in wanted if c in cf.columns]
+
+    motion_params = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z",
+                     "trans_x_derivative1", "trans_y_derivative1", "trans_z_derivative1",
+                     "rot_x_derivative1", "rot_y_derivative1", "rot_z_derivative1",
+                     "trans_x_power2", "trans_y_power2", "trans_z_power2",
+                     "rot_x_power2", "rot_y_power2",  "rot_z_power2",
+                     "trans_x_derivative1_power2", "trans_y_derivative1_power2", "trans_z_derivative1_power2",
+                     "rot_x_derivative1_power2",   "rot_y_derivative1_power2", "rot_z_derivative1_power2"]
+
+    acompcor_params = ["a_comp_cor_00", "a_comp_cor_01", "a_comp_cor_02", "a_comp_cor_03", "a_comp_cor_04"]
+    acompcor_available = [c for c in acompcor_params if c in cf.columns]
+    if not acompcor_available:
+        print("[confounds] WARNING: No aCompCor columns found. "
+              "Consider adding global_signal as fallback.")
+
+    # Non-steady-state outliers (first few TRs before magnetisation equilibrium)
+    nss_cols = [c for c in cf.columns if c.startswith("non_steady_state_outlier")]
+
+    # Volume-level spike regressors (single-volume indicator columns from fMRIPrep)
+    spike_cols = [c for c in cf.columns if c.startswith("motion_outlier")]
+
+    wanted = motion_params + acompcor_params + nss_cols + spike_cols
+    cols = [c for c in wanted if c in cf.columns]
+
     result = cf[cols].fillna(0)
-    print(f"Confounds selected: {len(cols)} columns")
+
+    # Warn if any non-motion column has unexpected NaNs (fillna(0) would silently bias it)
+    suspicious = [c for c in cols if cf[c].isna().sum() > 1]
+    if suspicious:
+        print(f"[confounds] WARNING: columns with >1 NaN (filled with 0): {suspicious}")
+
+    print(f"[confounds] Selected {len(cols)} columns "
+          f"({len(nss_cols)} NSS, {len(spike_cols)} spikes).")
     return result
 
 
@@ -161,9 +178,9 @@ def select_confounds(confounds_file: str) -> pd.DataFrame:
 # Contrast definitions
 ###
 
-contrasts = {"emotion_vs_neutral": "anger + contempt + pride + joy - 4*neutral", #H01
-             "negative_vs_neutral": "anger + contempt - 2*neutral", #H02
-             "positive_vs_neutral": "pride + joy - 2*neutral", #H03
+contrasts = {"emotion_vs_neutral": "(anger + contempt + pride + joy) / 4 - neutral", #H01
+             "negative_vs_neutral": "(anger + contempt) / 2 - neutral", #H02
+             "positive_vs_neutral": "(pride + joy) / 2 - neutral", #H03
              "negative_vs_positive": "anger + contempt - pride - joy"} #H04
 
 
@@ -214,7 +231,8 @@ def run_first_level(sub_id: str, paths: dict, output_dir: str, overwrite: bool =
         beta_img = glm.compute_contrast(formula, output_type="effect_size")
         z_img = glm.compute_contrast(formula, output_type="z_score")
         nib.save(beta_img, beta_paths[name])
-        nib.save(z_img, beta_paths[name].replace("_beta.", "_zstat."))
+        z_path = os.path.join(fl_dir, f"{sub_id}_{name}_zstat.nii.gz")
+        nib.save(z_img, z_path)
         beta_imgs[name] = beta_img
 
     print(f"[{sub_id}] First-level done.")
@@ -277,27 +295,46 @@ def build_roi_masks() -> dict:
     ho_cort = fetch_atlas_harvard_oxford("cort-maxprob-thr25-2mm")
 
     def mask_from_labels(atlas, keywords):
-        labels = atlas.labels
+        labels  = atlas.labels
         indices = [i for i, l in enumerate(labels)
                    if any(kw.lower() in l.lower() for kw in keywords)]
         print(f"ROI labels matched: {[labels[i] for i in indices]}")
         data = np.asarray(atlas.maps.dataobj)
-        # Harvard-Oxford label indices are 1-based in the image
         binary = np.isin(data, [i + 1 for i in indices]).astype(np.int8)
         return nib.Nifti1Image(binary, atlas.maps.affine)
 
-    return {"amygdala": mask_from_labels(ho_sub,  ["amygdala"]),
-        "dmPFC": mask_from_labels(ho_cort, ["paracingulate", "cingulate gyrus, anterior"])}
-        # dmPFC as 'Paracingulate Gyrus' + 'Cingulate Gyrus, anterior division' which approximate dmPFC/dACC
+    def mask_from_exact_label(atlas, exact_keyword):
+        labels  = atlas.labels
+        indices = [i for i, l in enumerate(labels)
+                   if exact_keyword.lower() in l.lower()]
+        print(f"ROI labels matched [{exact_keyword}]: {[labels[i] for i in indices]}")
+        data = np.asarray(atlas.maps.dataobj)
+        binary = np.isin(data, [i + 1 for i in indices]).astype(np.int8)
+        return nib.Nifti1Image(binary, atlas.maps.affine)
+
+    def print_centroid(img, label):
+        data = np.asarray(img.dataobj)
+        vox  = np.array(np.where(data > 0)).mean(axis=1)
+        aff  = img.affine
+        mni  = aff[:3, :3] @ vox + aff[:3, 3]
+        print(f"[ROI centroid] {label}: MNI ({mni[0]:.1f}, {mni[1]:.1f}, {mni[2]:.1f})")
+
+    masks = {"amygdala_L": mask_from_exact_label(ho_sub,  "left amygdala"),
+             "amygdala_R": mask_from_exact_label(ho_sub,  "right amygdala"),
+             "dmPFC":      mask_from_labels(ho_cort, ["paracingulate", "cingulate gyrus, anterior"])}
+
+    for name, img in masks.items():
+        print_centroid(img, name)
+
+    return masks
 
 
 # Compute mean beta estimate across all voxels in each ROI mask
-def extract_roi_betas(sub_id: str, beta_imgs: dict, roi_masks: dict) -> dict:
+def extract_roi_betas(sub_id: str, beta_imgs: dict, fitted_maskers: dict) -> dict:
     row = {"subject": sub_id}
-    for roi_name, mask_img in roi_masks.items():
-        masker = NiftiMasker(mask_img=mask_img, standardize=False)
+    for roi_name, masker in fitted_maskers.items():
         for contrast_name, beta_img in beta_imgs.items():
-            vals = masker.fit_transform(beta_img)
+            vals = masker.transform(beta_img)
             row[f"{contrast_name}_{roi_name}"] = float(np.nanmean(vals))
     return row
 
@@ -339,10 +376,15 @@ def roi_regression(roi_df: pd.DataFrame, pheno: pd.DataFrame, output_dir: str) -
 
     res = pd.DataFrame(results)
 
-    # FDR-BH correction
-    valid_mask = res["p_unc"].notna()
-    _, p_fdr, _, _ = multipletests(res.loc[valid_mask, "p_unc"].values, alpha=roi_fdr_alpha, method="fdr_bh")
-    res.loc[valid_mask, "p_fdr"] = p_fdr
+    # FDR-BH correction applied per ROI separately.
+    res["p_fdr"] = np.nan
+    for roi_name in ["amygdala_L", "amygdala_R", "dmPFC"]:
+        roi_mask = res["roi_contrast"].str.endswith(f"_{roi_name}")
+        valid    = roi_mask & res["p_unc"].notna()
+        if valid.sum() == 0:
+            continue
+        _, p_fdr_roi, _, _ = multipletests(res.loc[valid, "p_unc"].values, alpha=roi_fdr_alpha, method="fdr_bh")
+        res.loc[valid, "p_fdr"] = p_fdr_roi
     res["sig_fdr"] = res["p_fdr"] < roi_fdr_alpha
 
     out = os.path.join(output_dir, "roi", "roi_regression_results.csv")
@@ -362,6 +404,8 @@ def whole_brain_regression(beta_paths_by_contrast: dict, pheno: pd.DataFrame, ou
     os.makedirs(os.path.join(output_dir, "second_level"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "figures"),      exist_ok=True)
 
+    group_mask = load_mni152_brain_mask(resolution=2)
+
     covar_cols = [c for c in ["neuroticism_z", "age", "sex_code", "mean_fd"]
                   if c in pheno.columns]
 
@@ -374,44 +418,97 @@ def whole_brain_regression(beta_paths_by_contrast: dict, pheno: pd.DataFrame, ou
         # Only keep subjects present in phenotype with no NaN in covariates
         pheno_sub = pheno.reindex(subs)[covar_cols].dropna()
         keep_subs = list(pheno_sub.index)
-        imgs      = [p for p, s in valid if s in keep_subs]
-        pheno_sub = pheno_sub.loc[keep_subs]
+        path_for_sub = {s: p for p, s in valid}
+        imgs = [path_for_sub[s] for s in keep_subs]
+        dm = pheno_sub.loc[keep_subs, covar_cols].copy()
+        dm.insert(0, "intercept", 1.0)
+        dm.reset_index(drop=True, inplace=True)
 
         if len(imgs) < 10:
             print(f"[SKIP] {contrast}: only {len(imgs)} valid subjects.")
             continue
 
-        print(f"\n[whole-brain] {contrast}: N = {len(imgs)}")
-
-        # Design matrix: intercept + covariates (neuroticism_z first for contrast)
-        dm = pheno_sub[covar_cols].copy()
-        dm.insert(0, "intercept", 1.0)
-        dm = dm.reset_index(drop=True)
-
-        second_level = SecondLevelModel(n_jobs=-1)
+        second_level = SecondLevelModel(mask_img=group_mask, n_jobs=-1)
         second_level.fit(imgs, design_matrix=dm)
 
         z_img = second_level.compute_contrast(second_level_contrast="neuroticism_z", output_type="z_score")
 
-        # Threshold: p < 0.001 uncorrected + minimum cluster size
-        thresh_img, thresh_z = threshold_stats_img(z_img, alpha=0.001, height_control="fpr", cluster_threshold=wb_cluster_k)
-        # FDR threshold
+        # Primary: FDR-corrected at q < 0.05
         fdr_img, fdr_z = threshold_stats_img(z_img, alpha=0.05, height_control="fdr")
+
+        # Supplementary: uncorrected p < 0.001 + cluster extent
+        unc_img, unc_z = threshold_stats_img(z_img, alpha=0.001, height_control="fpr", cluster_threshold=wb_cluster_k)
 
         base = os.path.join(output_dir, "second_level", contrast)
         nib.save(z_img, f"{base}_z.nii.gz")
-        nib.save(thresh_img, f"{base}_z_p001_k{wb_cluster_k}.nii.gz")
         nib.save(fdr_img, f"{base}_z_fdr05.nii.gz")
-        print(f"Saved z-maps for {contrast}.")
+        nib.save(unc_img, f"{base}_z_p001_k{wb_cluster_k}.nii.gz")
 
-        # Figure: glass brain of thresholded map
-        fig_path = os.path.join(output_dir, "figures", f"{contrast}_wholebrain_neuroticism.png")
-        display = plotting.plot_glass_brain(thresh_img, title=(f"Neuroticism ~ {contrast}\n"
-                                                               f"z > {thresh_z:.2f}, k ≥ {wb_cluster_k} voxels"),
-                                            colorbar=True, plot_abs=False)
-        display.savefig(fig_path, dpi=150)
+        # Glass brain figure
+        glass_path = os.path.join(output_dir, "figures",
+                                  f"{contrast}_glass_neuroticism.png")
+        fig_glass = plt.figure(figsize=(14, 4), facecolor="black")
+        display = plotting.plot_glass_brain(fdr_img,
+                                            figure         = fig_glass,
+                                            display_mode   = "lyrz",
+                                            colorbar       = True,
+                                            plot_abs       = False,
+                                            cmap           = "cold_hot",
+                                            vmax           = 5.0,
+                                            title          = None,
+                                            annotate       = True,
+                                            alpha          = 0.85)
+
+        fig_glass.text(0.01, 0.92, f"Neuroticism × {contrast.replace('_', ' ')}  |  FDR q<0.05",
+                       color="white", fontsize=11, fontweight="bold",
+                       transform=fig_glass.transFigure)
+        fig_glass.text(0.01, 0.82, f"z > {fdr_z:.2f}   N = {len(imgs)}",
+                       color="#aaaaaa", fontsize=9,
+                       transform=fig_glass.transFigure)
+        display.savefig(glass_path, dpi=200, facecolor="black")
         display.close()
-        print(f"Figure: {fig_path}")
+        plt.close(fig_glass)
+        print(f"Glass brain: {glass_path}")
+
+        # Stat map on anatomical slices
+        slices_path = os.path.join(output_dir, "figures", f"{contrast}_slices_neuroticism.png")
+
+        # Only generate if there is surviving signal (avoids empty slice figures)
+        fdr_data = np.asarray(fdr_img.dataobj)
+        if np.any(fdr_data != 0):
+            fig_slices, axes = plt.subplots(3, 1, figsize=(16, 9), facecolor="black")
+            # Axial, coronal, sagittal rows
+            for ax, mode, cuts in zip(axes, ["z", "y", "x"], [range(-20, 61, 10), range(-30, 51, 10), range(-30, 31, 10)]):
+                display2 = plotting.plot_stat_map(fdr_img,
+                                                  bg_img         = None,          # uses MNI152 template automatically
+                                                  display_mode   = mode,
+                                                  cut_coords     = list(cuts),
+                                                  colorbar       = False,
+                                                  cmap           = "cold_hot",
+                                                  vmax           = 5.0,
+                                                  symmetric_cbar = True,
+                                                  threshold      = fdr_z,
+                                                  annotate       = True,
+                                                  draw_cross     = False,
+                                                  black_bg       = True,
+                                                  axes           = ax)
+            # Single shared colourbar
+            sm = plt.cm.ScalarMappable(cmap="cold_hot", norm=plt.Normalize(vmin=-5.0, vmax=5.0))
+            sm.set_array([])
+            cbar = fig_slices.colorbar(sm, ax=axes.ravel().tolist(), orientation="vertical",
+                                       fraction=0.015, pad=0.01,shrink=0.6)
+            cbar.set_label("z-score", color="white", fontsize=10)
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+            fig_slices.suptitle(f"Neuroticism × {contrast.replace('_', ' ')}  |  FDR q<0.05  |  N={len(imgs)}",
+                                color="white", fontsize=13, fontweight="bold", y=0.98)
+            fig_slices.tight_layout(rect=[0, 0, 0.97, 0.96])
+            fig_slices.savefig(slices_path, dpi=200, facecolor="black", bbox_inches="tight")
+            plt.close(fig_slices)
+            print(f"Slice figure: {slices_path}")
+        else:
+            print(f"[{contrast}] FDR map empty — no slice figure generated.")
 
 
 ###
@@ -424,20 +521,47 @@ def scatter_roi(roi_df: pd.DataFrame, pheno: pd.DataFrame,
     col = f"{contrast}_{roi}"
     if col not in roi_df.columns:
         return
-    df = roi_df[[col]].join(pheno[["neuroticism"]], how="inner").dropna()
+
+    covar_cols = [c for c in ["age", "sex_code", "mean_fd"] if c in pheno.columns]
+    df = roi_df[[col]].join(pheno[["neuroticism", "neuroticism_z"] + covar_cols], how="inner").dropna()
     if len(df) < 5:
         return
 
+    if covar_cols:
+        nuisance_formula = " + ".join(covar_cols)
+        res_y = smf.ols(f"`{col}` ~ {nuisance_formula}", data=df).fit().resid
+        res_x = smf.ols(f"neuroticism ~ {nuisance_formula}", data=df).fit().resid
+    else:
+        res_y = df[col]
+        res_x = df["neuroticism"]
+
+    # Fit partial regression to obtain slope, CI, and prediction band
+    partial_df = pd.DataFrame({"x": res_x.values, "y": res_y.values})
+    fit        = smf.ols("y ~ x", data=partial_df).fit()
+    slope      = fit.params["x"]
+    slope_ci   = fit.conf_int().loc["x"]   # index 0 = lower, 1 = upper
+
+    xs     = np.linspace(res_x.min(), res_x.max(), 100)
+    xs_df  = pd.DataFrame({"x": xs})
+    pred   = fit.get_prediction(xs_df).summary_frame(alpha=0.05)
+
+    # Build figure — ax must exist before any ax.* calls
+    plt.style.use("seaborn-v0_8-whitegrid")
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.scatter(df["neuroticism"], df[col], s=25, alpha=0.6, color="steelblue",
-               edgecolors="white", linewidths=0.4)
-    slope, intercept = np.polyfit(df["neuroticism"].to_numpy(dtype=float), df[col].to_numpy(dtype=float), 1)
-    xs = np.linspace(df["neuroticism"].min(), df["neuroticism"].max(), 100)
-    ax.plot(xs, slope * xs + intercept, color="crimson", lw=2)
-    ax.set_xlabel("NEO-FFI Neuroticism", fontsize=11)
-    ax.set_ylabel(f"Mean β [{roi}]", fontsize=11)
-    ax.set_title(f"{contrast}\n× Neuroticism ({roi})", fontsize=10)
+    ax.scatter(res_x, res_y, s=30, alpha=0.55, color="#4C72B0", edgecolors="white", linewidths=0.3, zorder=3)
+    ax.plot(xs, pred["mean"], color="#C44E52", lw=2, zorder=4)
+    ax.fill_between(xs, pred["mean_ci_lower"], pred["mean_ci_upper"], color="#C44E52", alpha=0.18, zorder=2,
+                    label=f"β = {slope:.3f}  95% CI [{slope_ci[0]:.3f}, {slope_ci[1]:.3f}]")
+    ax.axhline(0, color="#888888", lw=0.8, ls="--", zorder=1)
+    ax.axvline(0, color="#888888", lw=0.8, ls="--", zorder=1)
+    ax.set_xlabel("Neuroticism (residualised)", fontsize=11)
+    ax.set_ylabel(f"Mean β [{roi}]\n(residualised)", fontsize=11)
+    ax.set_title(f"{contrast.replace('_', ' ')} × Neuroticism\n{roi} — partial regression", fontsize=10, pad=8)
+    ax.legend(fontsize=8, loc="upper right", framealpha=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     fig.tight_layout()
+
     os.makedirs(os.path.join(output_dir, "figures"), exist_ok=True)
     out = os.path.join(output_dir, "figures", f"scatter_{contrast}_{roi}.png")
     fig.savefig(out, dpi=150)
@@ -484,8 +608,21 @@ def main(test_subject: str = None, overwrite: bool = False):
 
     print(f"[QC] Included: {len(included)},  Excluded: {len(excluded)}")
 
+    # Re-standardise neuroticism within the included sample
+    neuro_mean = pheno.loc[included, "neuroticism"].mean()
+    neuro_std  = pheno.loc[included, "neuroticism"].std()
+    pheno["neuroticism_z"] = (pheno["neuroticism"] - neuro_mean) / neuro_std
+    print(f"[phenotype] Neuroticism z-score re-standardised in N={len(included)} included subjects.")
+
     # 4. First-level GLM loop
     roi_masks = build_roi_masks()
+
+    fitted_maskers = {}
+    for roi_name, mask_img in roi_masks.items():
+        m = NiftiMasker(mask_img=mask_img, standardize=False)
+        m.fit()
+        fitted_maskers[roi_name] = m
+
     roi_rows = []
     all_betas = {}
 
@@ -505,7 +642,7 @@ def main(test_subject: str = None, overwrite: bool = False):
             all_betas[cname].append(bpath)
 
         # Extract ROI mean betas
-        row = extract_roi_betas(sub, beta_imgs, roi_masks)
+        row = extract_roi_betas(sub, beta_imgs, fitted_maskers)
         roi_rows.append(row)
 
     # 5. ROI second-level
@@ -520,7 +657,7 @@ def main(test_subject: str = None, overwrite: bool = False):
 
     # Scatter plots for primary ROI results
     for contrast in ["negative_vs_neutral", "emotion_vs_neutral", "positive_vs_neutral", "negative_vs_positive"]:
-        for roi in ["amygdala", "dmPFC"]:
+        for roi in ["amygdala_L", "amygdala_R", "dmPFC"]:
             scatter_roi(roi_df, pheno, contrast, roi, output)
 
     # 6. Whole-brain second-level
